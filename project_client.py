@@ -1,7 +1,37 @@
 import os
 import requests
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from models import Card
+
+
+def _normalize_for_compare(s: str) -> str:
+    if not s:
+        return ""
+    return " ".join(s.lower().split())
+
+
+def _is_similar_title(existing_title: str, new_title: str) -> bool:
+    a = _normalize_for_compare(existing_title)
+    b = _normalize_for_compare(new_title)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if a in b or b in a:
+        return True
+    return False
+
+
+def _is_similar_description(existing_desc: str, new_desc: str) -> bool:
+    a = _normalize_for_compare((existing_desc or "")[:500])
+    b = _normalize_for_compare((new_desc or "")[:500])
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if len(a) > 50 and len(b) > 50 and (a in b or b in a):
+        return True
+    return False
 
 
 class GitHubProjectClient:
@@ -12,7 +42,10 @@ class GitHubProjectClient:
         repo: str,
         project_id: str,
         status_field_id: str,
-        area_field_id: str
+        status_backlog_option_id: str,
+        area_field_id: str,
+        area_frontend_option_id: str,
+        area_backend_option_id: str
     ):
         """
         Inicializa o cliente do GitHub Projects v2.
@@ -23,14 +56,20 @@ class GitHubProjectClient:
             repo: Nome do repositório
             project_id: ID do GitHub Project (Projects v2)
             status_field_id: ID do campo de status no Project
+            status_backlog_option_id: ID da opção "Backlog" no campo Status
             area_field_id: ID do campo de área no Project
+            area_frontend_option_id: ID da opção Front-End no campo Area
+            area_backend_option_id: ID da opção Back-End no campo Area
         """
         self.token = token
         self.owner = owner
         self.repo = repo
         self.project_id = project_id
         self.status_field_id = status_field_id
+        self.status_backlog_option_id = status_backlog_option_id
         self.area_field_id = area_field_id
+        self.area_frontend_option_id = area_frontend_option_id
+        self.area_backend_option_id = area_backend_option_id
         self.graphql_url = "https://api.github.com/graphql"
         self.headers = {
             "Authorization": f"Bearer {token}",
@@ -96,6 +135,107 @@ class GitHubProjectClient:
             print(f"Erro ao buscar issue #{issue_number}: {e}")
             return None
     
+    def list_existing_project_issues(self) -> List[Tuple[str, str]]:
+        """
+        Lista título e descrição das issues já presentes no Project (via API GraphQL).
+        Usado para evitar criar issues duplicadas.
+        
+        Returns:
+            Lista de (title, body) das issues no Project
+        """
+        result = []
+        cursor = None
+        page_size = 100
+        
+        query = """
+        query($projectId: ID!, $first: Int!, $after: String) {
+            node(id: $projectId) {
+                ... on ProjectV2 {
+                    items(first: $first, after: $after) {
+                        nodes {
+                            id
+                            content {
+                                ... on Issue {
+                                    title
+                                    body
+                                }
+                            }
+                        }
+                        pageInfo {
+                            hasNextPage
+                            endCursor
+                        }
+                    }
+                }
+            }
+        }
+        """
+        
+        try:
+            while True:
+                variables = {
+                    "projectId": self.project_id,
+                    "first": page_size,
+                    "after": cursor
+                }
+                response = requests.post(
+                    self.graphql_url,
+                    json={"query": query, "variables": variables},
+                    headers=self.headers
+                )
+                response.raise_for_status()
+                data = response.json()
+                
+                if "errors" in data:
+                    print(f"Aviso: erro ao listar issues do Project: {data['errors']}")
+                    return result
+                
+                node = data.get("data", {}).get("node")
+                if not node:
+                    return result
+                
+                items = node.get("items", {})
+                nodes = items.get("nodes", [])
+                page_info = items.get("pageInfo", {})
+                
+                for item in nodes:
+                    content = item.get("content")
+                    if content and content.get("title") is not None:
+                        result.append((
+                            content.get("title") or "",
+                            content.get("body") or ""
+                        ))
+                
+                if not page_info.get("hasNextPage"):
+                    break
+                cursor = page_info.get("endCursor")
+            
+            return result
+        except Exception as e:
+            print(f"Aviso: não foi possível listar issues do Project: {e}")
+            return result
+    
+    def filter_cards_duplicates(self, cards: List[Card]) -> List[Card]:
+        """
+        Compara os cards com as issues já existentes no Project (título e descrição).
+        Retorna apenas os cards que não são claramente similares a nenhuma issue existente.
+        """
+        existing = self.list_existing_project_issues()
+        if not existing:
+            return list(cards)
+        to_create = []
+        for c in cards:
+            is_dup = False
+            for (ext, exb) in existing:
+                if _is_similar_title(ext, c.title) and _is_similar_description(exb, c.description):
+                    is_dup = True
+                    break
+            if is_dup:
+                print(f"Pulando possível duplicata (já existe no Project): \"{c.title}\"")
+            else:
+                to_create.append(c)
+        return to_create
+    
     def add_issue_to_project(self, issue_number: str, card: Card) -> bool:
         """
         Adiciona uma issue ao Project e configura seus campos.
@@ -112,7 +252,7 @@ class GitHubProjectClient:
             print(f"Não foi possível obter ID da issue #{issue_number}")
             return False
         
-        area_value = "Front-End" if card.type.value == "Front-End" else "Back-end"
+        area_option_id = self.area_frontend_option_id if card.type.value == "Front-End" else self.area_backend_option_id
         
         add_item_mutation = """
         mutation($projectId: ID!, $contentId: ID!) {
@@ -156,14 +296,14 @@ class GitHubProjectClient:
                 print(f"Erro: não foi possível obter ID do item do Project para issue #{issue_number}")
                 return False
             
-            update_field_mutation = """
-            mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $value: String!) {
+            update_status_mutation = """
+            mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
                 updateProjectV2ItemFieldValue(input: {
                     projectId: $projectId
                     itemId: $itemId
                     fieldId: $fieldId
                     value: {
-                        text: $value
+                        singleSelectOptionId: $optionId
                     }
                 }) {
                     projectV2Item {
@@ -177,12 +317,12 @@ class GitHubProjectClient:
                 "projectId": self.project_id,
                 "itemId": item_id,
                 "fieldId": self.status_field_id,
-                "value": "Backlog Dev"
+                "optionId": self.status_backlog_option_id
             }
             
             status_response = requests.post(
                 self.graphql_url,
-                json={"query": update_field_mutation, "variables": status_variables},
+                json={"query": update_status_mutation, "variables": status_variables},
                 headers=self.headers
             )
             status_response.raise_for_status()
@@ -195,12 +335,12 @@ class GitHubProjectClient:
                 "projectId": self.project_id,
                 "itemId": item_id,
                 "fieldId": self.area_field_id,
-                "value": area_value
+                "optionId": area_option_id
             }
             
             area_response = requests.post(
                 self.graphql_url,
-                json={"query": update_field_mutation, "variables": area_variables},
+                json={"query": update_status_mutation, "variables": area_variables},
                 headers=self.headers
             )
             area_response.raise_for_status()
@@ -209,7 +349,8 @@ class GitHubProjectClient:
             if "errors" in area_data:
                 print(f"Aviso: erro ao atualizar área da issue #{issue_number}: {area_data['errors']}")
             
-            print(f"Issue #{issue_number} adicionada ao Project com Status='Backlog Dev' e Area='{area_value}'")
+            area_label = "Front-End" if card.type.value == "Front-End" else "Back-End"
+            print(f"Issue #{issue_number} adicionada ao Project com Status='Backlog' e Area='{area_label}'")
             return True
         
         except Exception as e:

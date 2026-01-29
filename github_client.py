@@ -23,57 +23,27 @@ class GitHubClient:
             "Accept": "application/vnd.github.v3+json"
         }
     
-    def ensure_labels_exist(self, frontend_label: str, backend_label: str):
-        """
-        Garante que as labels necessárias existem no repositório.
-        
-        Args:
-            frontend_label: Nome da label para Front-End
-            backend_label: Nome da label para Back-End
-        """
-        labels_to_create = [
-            {"name": frontend_label, "color": "0e8a16", "description": "Issues relacionadas ao front-end"},
-            {"name": backend_label, "color": "d73a4a", "description": "Issues relacionadas ao back-end"}
-        ]
-        
-        for label_data in labels_to_create:
-            label_name = label_data["name"]
-            url = f"{self.base_url}/repos/{self.owner}/{self.repo}/labels/{label_name}"
-            
-            try:
-                response = requests.get(url, headers=self.headers)
-                if response.status_code == 404:
-                    create_url = f"{self.base_url}/repos/{self.owner}/{self.repo}/labels"
-                    create_response = requests.post(create_url, json=label_data, headers=self.headers)
-                    if create_response.status_code in [201, 200]:
-                        print(f"Label '{label_name}' criada com sucesso")
-                    else:
-                        print(f"Erro ao criar label '{label_name}': {create_response.status_code}")
-                elif response.status_code == 200:
-                    print(f"Label '{label_name}' já existe")
-            except Exception as e:
-                print(f"Erro ao verificar/criar label '{label_name}': {e}")
-    
-    def create_issue(self, card: Card, frontend_label: str, backend_label: str) -> Optional[str]:
+    def create_issue(self, card: Card, parent_issue_number: Optional[str] = None) -> Optional[str]:
         """
         Cria uma issue no GitHub a partir de um card.
         
         Args:
             card: Card a ser convertido em issue
-            frontend_label: Nome da label para Front-End
-            backend_label: Nome da label para Back-End
+            parent_issue_number: Número da issue pai (#), se houver (para incluir no body)
             
         Returns:
             ID da issue criada (número como string) ou None em caso de erro
         """
-        label = frontend_label if card.type.value == "Front-End" else backend_label
-        
         acceptance_criteria_text = "\n".join([
             f"- [ ] {criterion}" for criterion in card.acceptance_criteria
         ])
         
+        parent_line = ""
+        if parent_issue_number:
+            parent_line = f"\n**Issue pai:** #{parent_issue_number}\n"
+        
         body = f"""## Descrição
-
+{parent_line}
 {card.description}
 
 ## Critérios de Aceitação
@@ -86,8 +56,7 @@ class GitHubClient:
         
         issue_data = {
             "title": card.title,
-            "body": body,
-            "labels": [label]
+            "body": body
         }
         
         url = f"{self.base_url}/repos/{self.owner}/{self.repo}/issues"
@@ -111,28 +80,26 @@ class GitHubClient:
     
     def create_issues_from_cards(
         self, 
-        cards: List[Card], 
-        frontend_label: str, 
-        backend_label: str
+        cards: List[Card]
     ) -> List[str]:
         """
         Cria múltiplas issues a partir de uma lista de cards.
         
         Args:
             cards: Lista de cards para converter em issues
-            frontend_label: Nome da label para Front-End
-            backend_label: Nome da label para Back-End
             
         Returns:
             Lista de IDs das issues criadas
         """
         print(f"\nCriando {len(cards)} issues no GitHub...")
         
-        self.ensure_labels_exist(frontend_label, backend_label)
-        
         issue_numbers = []
-        for card in cards:
-            issue_number = self.create_issue(card, frontend_label, backend_label)
+        for i, card in enumerate(cards):
+            parent_num = None
+            pi = getattr(card, "parent_index", None)
+            if pi is not None and 0 <= pi < len(issue_numbers):
+                parent_num = issue_numbers[pi]
+            issue_number = self.create_issue(card, parent_issue_number=parent_num)
             if issue_number:
                 issue_numbers.append(issue_number)
         

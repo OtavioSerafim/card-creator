@@ -28,7 +28,10 @@ def load_environment():
         "GITHUB_REPO",
         "GITHUB_PROJECT_ID",
         "GITHUB_STATUS_FIELD_ID",
-        "GITHUB_AREA_FIELD_ID"
+        "STATUS_BACKLOG_OPTION_ID",
+        "GITHUB_AREA_FIELD_ID",
+        "AREA_FRONTEND_OPTION_ID",
+        "AREA_BACKEND_OPTION_ID"
     ]
     
     missing_vars = [var for var in required_vars if not os.getenv(var)]
@@ -44,10 +47,10 @@ def load_environment():
         "github_repo": os.getenv("GITHUB_REPO"),
         "github_project_id": os.getenv("GITHUB_PROJECT_ID"),
         "github_status_field_id": os.getenv("GITHUB_STATUS_FIELD_ID"),
+        "status_backlog_option_id": os.getenv("STATUS_BACKLOG_OPTION_ID"),
         "github_area_field_id": os.getenv("GITHUB_AREA_FIELD_ID"),
-        "frontend_label": os.getenv("FRONTEND_LABEL", "frontend"),
-        "backend_label": os.getenv("BACKEND_LABEL", "backend"),
-        "fullstack_label": os.getenv("FULLSTACK_LABEL", "fullstack")
+        "area_frontend_option_id": os.getenv("AREA_FRONTEND_OPTION_ID"),
+        "area_backend_option_id": os.getenv("AREA_BACKEND_OPTION_ID")
     }
 
 
@@ -69,6 +72,18 @@ def main():
     
     env = load_environment()
     
+    project_client = GitHubProjectClient(
+        token=env["github_token"],
+        owner=env["github_owner"],
+        repo=env["github_repo"],
+        project_id=env["github_project_id"],
+        status_field_id=env["github_status_field_id"],
+        status_backlog_option_id=env["status_backlog_option_id"],
+        area_field_id=env["github_area_field_id"],
+        area_frontend_option_id=env["area_frontend_option_id"],
+        area_backend_option_id=env["area_backend_option_id"]
+    )
+    
     try:
         print("ETAPA 1: Extraindo conteúdo do PDF...")
         pdf_content = read_pdf(pdf_path)
@@ -78,15 +93,25 @@ def main():
             sys.exit(1)
         
         print()
-        print("ETAPA 2: Gerando cards com Gemini...")
-        cards = generate_cards(pdf_content, env["gemini_api_key"])
-        
-        if not cards:
-            print("Erro: nenhum card foi gerado")
-            sys.exit(1)
+        print("ETAPA 2: Listando issues já existentes no GitHub Project...")
+        existing_issues = project_client.list_existing_project_issues()
+        print(f"Encontradas {len(existing_issues)} issues no Project (serão usadas como contexto para evitar duplicatas).")
         
         print()
-        print("ETAPA 3: Criando issues no GitHub...")
+        print("ETAPA 3: Gerando cards com Gemini (com contexto de issues existentes)...")
+        cards = generate_cards(
+            pdf_content,
+            env["gemini_api_key"],
+            existing_issues=existing_issues if existing_issues else None
+        )
+        
+        if not cards:
+            print("Nenhum card novo gerado (especificação já coberta ou sem requisitos adicionais).")
+            print("=" * 60)
+            sys.exit(0)
+        
+        print()
+        print("ETAPA 4: Criando issues no GitHub...")
         github_client = GitHubClient(
             token=env["github_token"],
             owner=env["github_owner"],
@@ -94,9 +119,7 @@ def main():
         )
         
         issue_numbers = github_client.create_issues_from_cards(
-            cards=cards,
-            frontend_label=env["frontend_label"],
-            backend_label=env["backend_label"]
+            cards=cards
         )
         
         if not issue_numbers:
@@ -104,23 +127,14 @@ def main():
             sys.exit(1)
         
         print()
-        print("ETAPA 4: Adicionando issues ao GitHub Project...")
-        project_client = GitHubProjectClient(
-            token=env["github_token"],
-            owner=env["github_owner"],
-            repo=env["github_repo"],
-            project_id=env["github_project_id"],
-            status_field_id=env["github_status_field_id"],
-            area_field_id=env["github_area_field_id"]
-        )
-        
+        print("ETAPA 5: Adicionando issues ao GitHub Project...")
         project_client.add_issues_to_project(issue_numbers, cards)
         
         print()
         print("=" * 60)
         print("Processo concluído com sucesso!")
         print("=" * 60)
-        print(f"Total de cards processados: {len(cards)}")
+        print(f"Total de cards gerados (novos): {len(cards)}")
         print(f"Total de issues criadas: {len(issue_numbers)}")
         
         frontend_count = sum(1 for c in cards if c.type.value == "Front-End")
